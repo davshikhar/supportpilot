@@ -14,6 +14,8 @@ import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
 import org.springframework.ai.chat.client.advisor.vectorstore.QuestionAnswerAdvisor;
 import org.springframework.ai.chat.memory.ChatMemory;
 import org.springframework.ai.chat.messages.AssistantMessage;
+import org.springframework.ai.chat.messages.Message;
+import org.springframework.ai.chat.messages.MessageType;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.vectorstore.SearchRequest;
@@ -39,11 +41,15 @@ public class ChatController {
 //            "the requestRefund tool. A refund is only REQUESTED until the customer confirms it themselves. " +
 //            "Never say a refund is approved, completed or processed. Never guess the order details. "+"Only call getOrderStatus tool when the customer asks about the status or details of a specific order." +
 //            " Only call requestRefund tool when the customer explicitly wants to initiate or request a refund, and has provided both an order ID and a reason. "+"If you are unsure or the context does not contain answer offer to connect with a human agent. Also keep the answer short and polite";
-    private static final String p="Only call `getOrderStatus` tool when the customer asks about the status or details of a specific order. " +
-        "Only call `requestRefund` tool when the customer explicitly wants to initiate or request a refund, and has provided both an order ID and a reason. " +
-        "All other questions general informational questions, not refund requests or status requests. For these questions, answer using the retrieved document context. Do not call any of the tool. "+
-        "Never invent policy details. If the retrieved context does not contain the answer, say that you don't have enough information and offer to connect the customer with a human agent.";
-
+    private static final String p="""
+        You are SupportPilot, a customer support assistant. Keep answers short and polite.
+        Answer general questions only from the retrieved document context. Never invent policy details.
+        If the context does not contain the answer, say you don't have that information and offer to connect the customer with a human agent.
+        If a tool is available for the request, use it: getOrderStatus for an order's status, requestRefund for a refund.
+        If the customer asks about an order's status or wants a refund and you have no tool for it, ask them to send the full request in one message, for example "What is the status of order ORD-1234?" or "I want a refund for ORD-1234 because ...".
+        Never state an order status or a refund result unless a tool returned it.
+        A refund is only REQUESTED until the customer confirms it with the Confirm button. Never say a refund is approved, completed or processed.
+        """;
 //    private static final String p="Do not call any of the tools, when the question is about refund policy. Answer only from the retrieved document context. Never invent policy details. If the retrieved context does not contain the answer, say that you don't have enough information and offer to connect the customer with a human agent.";
 
     private final ChatClient chatClient;
@@ -88,6 +94,12 @@ public class ChatController {
         AtomicBoolean toolUsed = new AtomicBoolean(false);
         System.out.println("Before AI call, toolUsed = " + toolUsed.get());
         ToolRouter.Route route = tool.route(question);
+        if(route == ToolRouter.Route.NONE && tool.hasOrderId(question)){
+            String history = recentUserText(memoryId);
+            if(!history.isBlank()){
+                route = tool.route(history +" "+question);
+            }
+        }
         var promptSpec = chatClient.prompt()
                 .user(request.message())
                 .toolContext(Map.of("userId",userId, "toolUsed",toolUsed))
@@ -142,13 +154,6 @@ public class ChatController {
         return ResponseEntity.ok().header("X-conversation-Id", convId).body(tokens);
     }
 
-    /// To check if the userId is valid or not
-    private void validUser(String userId){
-        if(!userId.matches("^[A-Za-z0-9-]{1,64}$")){
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Invalid userId");
-        }
-    }
-
     public String giveId(ChatRequest req){
         return req.conversationId()!=null ? req.conversationId() : UUID.randomUUID().toString();
     }
@@ -164,5 +169,14 @@ public class ChatController {
                 .map(Object::toString)
                 .distinct()
                 .toList();
+    }
+
+    private String recentUserText(String memoryId){
+        List<String> texts = chatMemory.get(memoryId).stream()
+                .filter(m->m.getMessageType() == MessageType.USER)
+                .map(Message::getText)
+                .toList();
+        int from  = Math.max(0,texts.size()-3);
+        return String.join(" ",texts.subList(from, texts.size()));
     }
 }

@@ -23,15 +23,13 @@ public class ToolRouter {
 
         // 1. Detect an explicit request to initiate a refund.
         boolean refundIntent =
-                q.contains("request a refund") ||
-                        q.contains("request refund") ||
-                        q.contains("initiate a refund") ||
-                        q.contains("initiate refund") ||
-                        q.contains("i want a refund") ||
-                        q.contains("i'd like a refund") ||
-                        q.contains("i would like a refund") ||
-                        q.contains("please refund") ||
-                        q.contains("refund my order");
+                q.contains("request a refund") || q.contains("request refund") ||
+                        q.contains("initiate a refund") || q.contains("initiate refund") ||
+                        q.contains("i want a refund") || q.contains("i'd like a refund") ||
+                        q.contains("i would like a refund") || q.contains("please refund") ||
+                        q.contains("refund my order") ||
+                        (q.contains("refund") && (q.contains("i want") || q.contains("i need")
+                                || q.contains("please") || q.contains("request")));
 
         boolean hasOrderId = ORDER_ID.matcher(message).find();
 
@@ -61,7 +59,8 @@ public class ToolRouter {
                         q.contains("delivery status") ||
                         q.contains("order details") ||
                         q.contains("status of my order") ||
-                        q.contains("status of order");
+                        q.contains("status of order") || q.contains("status") || q.contains("track") || q.contains("where is") ||
+                        q.contains("delivery");
 
         if (orderStatusIntent && hasOrderId) {
             return Route.ORDER_STATUS;
@@ -70,5 +69,8 @@ public class ToolRouter {
         // 3. Informational questions and incomplete requests
         // get no tools.
         return Route.NONE;
+    }
+    public boolean hasOrderId(String message){
+        return ORDER_ID.matcher(message).find();
     }
 }
