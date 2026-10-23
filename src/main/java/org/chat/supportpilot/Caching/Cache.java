@@ -27,7 +27,7 @@ public class Cache {
     private final long ttlSeconds;
     public Cache(@Qualifier("cacheVectorStore") VectorStore vec,
                  RedisClient client,
-                 @Value("${supportpilot.cache.threshold:0.92}") double threshold,
+                 @Value("${supportpilot.cache.threshold:0.85}") double threshold,
                  @Value("${supportpilot.cache.ttl-minutes:60}") long ttl){
         this.vectorStore = vec;this.redisClient = client;
         this.threshold = threshold; this.ttlSeconds = ttl*60;

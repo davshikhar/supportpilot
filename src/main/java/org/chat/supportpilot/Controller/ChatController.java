@@ -69,7 +69,8 @@ public class ChatController {
         this.chatClient = builder.defaultSystem(p)
                 .defaultAdvisors(MessageChatMemoryAdvisor.builder(chatMemory).build(),
                         QuestionAnswerAdvisor.builder(vec).searchRequest(SearchRequest.builder()
-                                .topK(4).similarityThreshold(0.5).build()).build())
+//                                .topK(4).similarityThreshold(0.5).build()).build())
+                                .topK(4).similarityThreshold(0.0).build()).build())
                 .build();
         this.orderTool = orderTool;
         this.refundTool = refundTool;
@@ -82,7 +83,7 @@ public class ChatController {
         this.skipped = Counter.builder("supportpilot.cache.requests").tag("result","skipped").register(meterRegistry);
         this.hitTimer = Timer.builder("supportpilot.chat.latency").tag("served_by","cache").publishPercentiles(0.5,0.95).register(meterRegistry);
         this.modelTimer = Timer.builder("supportpilot.chat.latency").tag("served_by","model").publishPercentiles(0.5,0.95).register(meterRegistry);
-        Gauge.builder("supportpilot.cache.hit.raio", () -> {
+        Gauge.builder("supportpilot.cache.hit.ratio", () -> {
             double hit = hits.count();double total = hit + misses.count();
             return total == 0 ? 0:hit/total;
         }).register(meterRegistry);
@@ -183,13 +184,45 @@ public class ChatController {
         return req.conversationId()!=null ? req.conversationId() : UUID.randomUUID().toString();
     }
     private List<String> sourcesOf(ChatClientResponse res){
-        Object docs = res.context().get(QuestionAnswerAdvisor.RETRIEVED_DOCUMENTS);
-        if(!(docs instanceof List<?> list)){
+//        Object docs = res.context().get(QuestionAnswerAdvisor.RETRIEVED_DOCUMENTS);
+//        if(!(docs instanceof List<?> list)){
+//            return List.of();
+//        }
+//        return list.stream().filter(Document.class::isInstance)
+//                .map(Document.class::cast)
+//                .map(d -> d.getMetadata().get("source"))
+//                .filter(java.util.Objects::nonNull)
+//                .map(Object::toString)
+//                .distinct()
+//                .toList();
+        System.out.println("Advisor context keys = " + res.context().keySet());
+
+        Object docs = res.context().get(
+                QuestionAnswerAdvisor.RETRIEVED_DOCUMENTS
+        );
+
+        System.out.println("Retrieved documents object = " + docs);
+
+        if (docs == null) {
+            System.out.println("Retrieved documents are NULL");
             return List.of();
         }
-        return list.stream().filter(Document.class::isInstance)
+
+        if (!(docs instanceof List<?> list)) {
+            System.out.println("Unexpected retrieved documents type = "
+                    + docs.getClass().getName());
+            return List.of();
+        }
+
+        System.out.println("Retrieved document count = " + list.size());
+
+        return list.stream()
+                .filter(Document.class::isInstance)
                 .map(Document.class::cast)
-                .map(d -> d.getMetadata().get("source"))
+                .map(d -> {
+                    System.out.println("Document metadata = " + d.getMetadata());
+                    return d.getMetadata().get("source");
+                })
                 .filter(java.util.Objects::nonNull)
                 .map(Object::toString)
                 .distinct()
