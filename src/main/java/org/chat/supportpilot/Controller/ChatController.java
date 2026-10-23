@@ -44,9 +44,10 @@ public class ChatController {
     private static final String p="""
         You are SupportPilot, a customer support assistant. Keep answers short and polite.
         Answer general questions only from the retrieved document context. Never invent policy details.
-        If the context does not contain the answer, say you don't have that information and offer to connect the customer with a human agent.
+        Match questions to the context by meaning, not exact wording. For example, if the context says "refunds go back to the original payment method within 5 to 7 days", then "How long do refunds take?" or "What is the refund processing time?" should be answered "Refunds go back to your original payment method within 5 to 7 days after we receive the item."
+        If the context contains the answer, state it directly and do not mention a human agent. Only if the context truly does not contain the answer, say you don't have that information and offer to connect the customer with a human agent. Never say you don't have the information and then answer anyway.
         If a tool is available for the request, use it: getOrderStatus for an order's status, requestRefund for a refund.
-        If the customer asks about an order's status or wants a refund and you have no tool for it, ask them to send the full request in one message, for example "What is the status of order ORD-1234?" or "I want a refund for ORD-1234 because ...".
+        If the customer asks about an order's status or wants a refund and you have no tool for it, ask them to send the full request in one message, for example "What is the status of order ORD-1234?" or "I want a refund for ORD-1234 because ...". This applies only to requests about a specific order or a refund request, not to general policy questions such as how long refunds take.
         Never state an order status or a refund result unless a tool returned it.
         A refund is only REQUESTED until the customer confirms it with the Confirm button. Never say a refund is approved, completed or processed.
         """;
@@ -160,9 +161,11 @@ public class ChatController {
 
 
 
-        if(cacheable && !toolUsed.get() && !sources.isEmpty() && answer != null && !answer.isBlank()){
+        if(cacheable && !toolUsed.get() && !sources.isEmpty() && answer != null && !answer.isBlank()
+                && !looksLikeNonAnswer(answer)){
             cache.store(question,answer,sources);
         }
+
         modelTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS);
         return new ChatReply(answer,convId,sources, false);
     }
@@ -236,5 +239,12 @@ public class ChatController {
                 .toList();
         int from  = Math.max(0,texts.size()-3);
         return String.join(" ",texts.subList(from, texts.size()));
+    }
+
+    private boolean looksLikeNonAnswer(String a) {
+        String s = a.toLowerCase();
+        return s.contains("don't have") || s.contains("do not have")
+                || s.contains("doesn't provide") || s.contains("does not provide")
+                || s.contains("human agent");
     }
 }
