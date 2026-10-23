@@ -1,5 +1,6 @@
 package org.chat.supportpilot.Controller;
 
+import io.micrometer.core.instrument.*;
 import jakarta.validation.Valid;
 import org.chat.supportpilot.Auth;
 import org.chat.supportpilot.Caching.Cache;
@@ -20,16 +21,15 @@ import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.vectorstore.SearchRequest;
 import org.springframework.ai.vectorstore.VectorStore;
-import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
-import org.springframework.web.server.ResponseStatusException;
 import reactor.core.publisher.Flux;
 
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 @RestController
@@ -58,8 +58,14 @@ public class ChatController {
     private final Cache cache;
     private final ChatMemory chatMemory;
     private final ToolRouter tool;
+    private final MeterRegistry meterRegistry;
+    private final Counter hits;
+    private final Counter misses;
+    private final Counter skipped;
+    private final Timer hitTimer;
+    private final Timer modelTimer;
 
-    public ChatController(ChatClient.Builder builder, ChatMemory chatMemory, VectorStore vec, OrderTool orderTool, RefundTool refundTool, Cache cache, ToolRouter t){
+    public ChatController(ChatClient.Builder builder, ChatMemory chatMemory, VectorStore vec, OrderTool orderTool, RefundTool refundTool, Cache cache, ToolRouter t, MeterRegistry m){
         this.chatClient = builder.defaultSystem(p)
                 .defaultAdvisors(MessageChatMemoryAdvisor.builder(chatMemory).build(),
                         QuestionAnswerAdvisor.builder(vec).searchRequest(SearchRequest.builder()
@@ -70,6 +76,16 @@ public class ChatController {
         this.cache=cache;
         this.chatMemory = chatMemory;
         this.tool=t;
+        this.meterRegistry = m;
+        this.hits = Counter.builder("supportpilot.cache.requests").tag("result","hit").register(meterRegistry);
+        this.misses = Counter.builder("supportpilot.cache.requests").tag("result","miss").register(meterRegistry);
+        this.skipped = Counter.builder("supportpilot.cache.requests").tag("result","skipped").register(meterRegistry);
+        this.hitTimer = Timer.builder("supportpilot.chat.latency").tag("served_by","cache").publishPercentiles(0.5,0.95).register(meterRegistry);
+        this.modelTimer = Timer.builder("supportpilot.chat.latency").tag("served_by","model").publishPercentiles(0.5,0.95).register(meterRegistry);
+        Gauge.builder("supportpilot.cache.hit.raio", () -> {
+            double hit = hits.count();double total = hit + misses.count();
+            return total == 0 ? 0:hit/total;
+        }).register(meterRegistry);
     }
 
     @PostMapping("/chat")
@@ -81,14 +97,22 @@ public class ChatController {
         String memoryId = userId + ":" + convId;
         String question = request.message();
 
+        long start = System.nanoTime();
+
         boolean cacheable = cache.isCacheable(question) && chatMemory.get(memoryId).isEmpty();
         if(cacheable){
             var hit = cache.look(question);
             if(hit.isPresent()){
+                hits.increment();
                 var cached = hit.get();
                 chatMemory.add(memoryId, List.of(new UserMessage(question),new AssistantMessage(cached.answer())));
+                hitTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS);
                 return new ChatReply(cached.answer(), convId, cached.sources(), true);
             }
+            misses.increment();
+        }
+        else{
+            skipped.increment();
         }
 
         AtomicBoolean toolUsed = new AtomicBoolean(false);
@@ -138,6 +162,7 @@ public class ChatController {
         if(cacheable && !toolUsed.get() && !sources.isEmpty() && answer != null && !answer.isBlank()){
             cache.store(question,answer,sources);
         }
+        modelTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS);
         return new ChatReply(answer,convId,sources, false);
     }
 
