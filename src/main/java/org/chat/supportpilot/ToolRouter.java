@@ -32,9 +32,6 @@ public class ToolRouter {
                                 || q.contains("please") || q.contains("request")));
 
         boolean hasOrderId = ORDER_ID.matcher(message).find();
-
-        // A refund tool is available only when the request
-        // is explicit and has an order ID and a stated reason.
         boolean hasReason =
                 q.contains("because ") ||
                         q.contains("reason:") ||
@@ -49,8 +46,6 @@ public class ToolRouter {
         if (refundIntent && hasOrderId && hasReason) {
             return Route.REFUND_REQUEST;
         }
-
-        // 2. Detect requests for details/status of a specific order.
         boolean orderStatusIntent =
                 q.contains("order status") ||
                         q.contains("track my order") ||
@@ -65,9 +60,6 @@ public class ToolRouter {
         if (orderStatusIntent && hasOrderId) {
             return Route.ORDER_STATUS;
         }
-
-        // 3. Informational questions and incomplete requests
-        // get no tools.
         return Route.NONE;
     }
     public boolean hasOrderId(String message){

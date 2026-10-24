@@ -22,7 +22,7 @@ import org.springframework.ai.document.Document;
 import org.springframework.ai.vectorstore.SearchRequest;
 import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.http.MediaType;
-import org.springframework.http.ResponseEntity;
+import org.springframework.http.codec.ServerSentEvent;
 import org.springframework.web.bind.annotation.*;
 import reactor.core.publisher.Flux;
 
@@ -31,16 +31,12 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 @RestController
 @RequestMapping("/api")
 public class ChatController {
 
-//    private static final String p = "You are a customer support assistant. Answer only from provided context, conversation so far, and tool results." +
-//            " When the customer asks about an order, call the getOrderStatus tool. To start a refund, first make sure you have the order ID and the customer's reason, then call " +
-//            "the requestRefund tool. A refund is only REQUESTED until the customer confirms it themselves. " +
-//            "Never say a refund is approved, completed or processed. Never guess the order details. "+"Only call getOrderStatus tool when the customer asks about the status or details of a specific order." +
-//            " Only call requestRefund tool when the customer explicitly wants to initiate or request a refund, and has provided both an order ID and a reason. "+"If you are unsure or the context does not contain answer offer to connect with a human agent. Also keep the answer short and polite";
     private static final String p="""
         You are SupportPilot, a customer support assistant. Keep answers short and polite.
         Answer general questions only from the retrieved document context. Never invent policy details.
@@ -51,7 +47,11 @@ public class ChatController {
         Never state an order status or a refund result unless a tool returned it.
         A refund is only REQUESTED until the customer confirms it with the Confirm button. Never say a refund is approved, completed or processed.
         """;
-//    private static final String p="Do not call any of the tools, when the question is about refund policy. Answer only from the retrieved document context. Never invent policy details. If the retrieved context does not contain the answer, say that you don't have enough information and offer to connect the customer with a human agent.";
+
+    public record Meta(String conversationId){}
+    public record Token(String t){}
+    public record Done(List<String> sources, boolean cached){}
+    public record StreamError(String message){}
 
     private final ChatClient chatClient;
     private final OrderTool orderTool;
@@ -70,7 +70,6 @@ public class ChatController {
         this.chatClient = builder.defaultSystem(p)
                 .defaultAdvisors(MessageChatMemoryAdvisor.builder(chatMemory).build(),
                         QuestionAnswerAdvisor.builder(vec).searchRequest(SearchRequest.builder()
-//                                .topK(4).similarityThreshold(0.5).build()).build())
                                 .topK(4).similarityThreshold(0.0).build()).build())
                 .build();
         this.orderTool = orderTool;
@@ -88,6 +87,10 @@ public class ChatController {
             double hit = hits.count();double total = hit + misses.count();
             return total == 0 ? 0:hit/total;
         }).register(meterRegistry);
+    }
+
+    public static ServerSentEvent<Object> serverSentEvent(String event, Object data){
+        return ServerSentEvent.<Object>builder().event(event).data(data).build();
     }
 
     @PostMapping("/chat")
@@ -130,13 +133,6 @@ public class ChatController {
                 .user(request.message())
                 .toolContext(Map.of("userId",userId, "toolUsed",toolUsed))
                 .advisors(a->a.param(ChatMemory.CONVERSATION_ID, memoryId));
-//        ChatClientResponse response = chatClient.prompt()
-//                .user(request.message())
-//                .tools(orderTool,refundTool)
-//                .toolContext(Map.of("userId",userId, "toolUsed",toolUsed))
-//                .advisors(a->a.param(ChatMemory.CONVERSATION_ID, memoryId))
-//                .call()
-//                .chatClientResponse();
         switch (route) {
             case ORDER_STATUS ->
                     promptSpec = promptSpec.tools(orderTool);
@@ -145,7 +141,6 @@ public class ChatController {
                     promptSpec = promptSpec.tools(refundTool);
 
             case NONE -> {
-                // Intentionally expose no tools to the model.
             }
         }
         ChatClientResponse response = promptSpec.call().chatClientResponse();
@@ -171,33 +166,71 @@ public class ChatController {
     }
 
     @PostMapping(value="/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public ResponseEntity<Flux<String>> stream(@Valid @RequestBody ChatRequest req,
+    public Flux<ServerSentEvent<Object>> stream(@Valid @RequestBody ChatRequest req,
                                                @RequestHeader("X-User-Id") String userId){
         //To check if the userId is valid or not
         Auth.checkValid(userId);
         String convId = giveId(req);
         String memoryId = userId +":"+convId;
-        Flux<String> tokens = chatClient.prompt()
-                .user(req.message()).advisors(a->a.param(ChatMemory.CONVERSATION_ID, memoryId))
-                .stream().content();
-        return ResponseEntity.ok().header("X-conversation-Id", convId).body(tokens);
+        String question = req.message();
+        long start = System.nanoTime();
+        ServerSentEvent<Object> meta = serverSentEvent("meta",new Meta(convId));
+
+        boolean cacheable = cache.isCacheable(question) && chatMemory.get(memoryId).isEmpty();
+        if(cacheable){
+            var hit = cache.look(question);
+            if(hit.isPresent()){
+                hits.increment();
+                var cached = hit.get();
+                chatMemory.add(memoryId, List.of(new UserMessage(question),new AssistantMessage(cached.answer())));
+                hitTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS);
+                return Flux.just(meta, serverSentEvent("token", new Token(cached.answer())),serverSentEvent("done",new Done(cached.sources(), true)));
+            }
+            misses.increment();
+        }
+        else{
+            skipped.increment();
+        }
+        StringBuilder answer = new StringBuilder();
+        AtomicReference<List<String>> sources = new AtomicReference<>(List.of());
+        Flux<ServerSentEvent<Object>> tokens = chatClient.prompt()
+                .user(question)
+                .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, memoryId))
+                .stream()
+                .chatClientResponse()
+                .doOnNext(r -> {
+                    List<String> found = sourcesOf(r);
+                    if(!found.isEmpty()) sources.set(found);
+                })
+                .map(this::textOf)
+                .filter(t -> !t.isEmpty())
+                .doOnNext(answer::append)
+                .map(t -> serverSentEvent("token", new Token(t)));
+
+        Flux<ServerSentEvent<Object>> finish = Flux.defer(() -> {
+        String full = answer.toString();
+        if(cacheable && !sources.get().isEmpty() && !full.isBlank() && !looksLikeNonAnswer(full)){
+            cache.store(question, full, sources.get());
+        }
+        modelTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS);
+        return Flux.just(serverSentEvent("done", new Done(sources.get(), false)));});
+
+        return Flux.concat(Flux.just(meta), tokens, finish)
+                .onErrorResume(e -> Flux.just(serverSentEvent("error",
+                        new StreamError("The assistant had a problem. Please try again."))));
+    }
+
+    private String textOf(ChatClientResponse r){
+        var cr = r.chatResponse();
+        if(cr == null || cr.getResult()==null || cr.getResult().getOutput() == null) return "";
+        String t = cr.getResult().getOutput().getText();
+        return t == null ? "" : t;
     }
 
     public String giveId(ChatRequest req){
         return req.conversationId()!=null ? req.conversationId() : UUID.randomUUID().toString();
     }
     private List<String> sourcesOf(ChatClientResponse res){
-//        Object docs = res.context().get(QuestionAnswerAdvisor.RETRIEVED_DOCUMENTS);
-//        if(!(docs instanceof List<?> list)){
-//            return List.of();
-//        }
-//        return list.stream().filter(Document.class::isInstance)
-//                .map(Document.class::cast)
-//                .map(d -> d.getMetadata().get("source"))
-//                .filter(java.util.Objects::nonNull)
-//                .map(Object::toString)
-//                .distinct()
-//                .toList();
         System.out.println("Advisor context keys = " + res.context().keySet());
 
         Object docs = res.context().get(
